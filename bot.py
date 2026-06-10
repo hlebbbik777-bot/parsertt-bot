@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -119,6 +120,8 @@ def build_application() -> Application:
 
 def run_polling(app: Application) -> None:
     logger.info("Starting polling mode...")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
@@ -130,12 +133,15 @@ def run_webhook(app: Application) -> None:
     port = int(os.environ.get("PORT", "10000"))
     webhook_url = f"{base_url.rstrip('/')}/telegram"
     logger.info("Starting webhook mode on %s", webhook_url)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path="telegram",
         webhook_url=webhook_url,
         drop_pending_updates=True,
+        close_loop=False,
     )
 
 
@@ -161,8 +167,6 @@ def main() -> None:
     if mode == "polling":
         run_polling(app)
     elif mode == "webhook":
-        run_webhook(app)
-    elif os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL"):
         run_webhook(app)
     elif os.environ.get("PORT"):
         run_with_health_server(app)
