@@ -154,10 +154,18 @@ def run_with_health_server(app: Application) -> None:
     def health():
         return "ok", 200
 
-    thread = threading.Thread(target=run_polling, args=(app,), daemon=True)
+    thread = threading.Thread(
+        target=lambda: flask_app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False,
+        ),
+        daemon=True,
+    )
     thread.start()
-    logger.info("Health server on port %s", port)
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    logger.info("Health server in background on port %s", port)
+    run_polling(app)
 
 
 def main() -> None:
