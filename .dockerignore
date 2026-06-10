@@ -1,0 +1,6 @@
+fly.toml
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env

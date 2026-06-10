@@ -1,0 +1,11 @@
+app = "parsertt-bot"
+primary_region = "ams"
+
+[build]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[processes]
+  app = "python bot.py"
