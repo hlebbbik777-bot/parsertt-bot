@@ -1,10 +1,8 @@
-.env
 .venv/
-venv/
 __pycache__/
 *.pyc
-*.pyo
-.DS_Store
-.idea/
-.vscode/
+.env
+.instagram_session.json
+.instagram_session_id
 bot.log
+*.lock

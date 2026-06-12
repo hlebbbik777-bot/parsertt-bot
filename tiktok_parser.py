@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import csv
-import io
-import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -12,9 +10,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from comments_common import ParseError, build_result, make_comment, tiktok_urls
+
+logger = logging.getLogger(__name__)
 
 VIDEO_ID_RE = re.compile(r"/video/(\d+)")
-TIKTOK_HOSTS = ("tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com")
+TIKTOK_HOSTS = ("tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com")
 
 HEADERS = {
     "User-Agent": (
@@ -24,12 +28,30 @@ HEADERS = {
 }
 
 
-class TikTokParseError(Exception):
-    pass
+def _build_session(referer: str) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({**HEADERS, "Referer": referer})
+    retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _request_json(session: requests.Session, url: str, params: dict[str, Any]) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(4):
+        try:
+            resp = session.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+            time.sleep(0.8 * (attempt + 1))
+    raise ParseError(f"TikTok: ошибка сети — {last_exc}")
 
 
 def resolve_video_id(url: str, session: requests.Session | None = None) -> tuple[str, str]:
-    """Return (video_id, canonical_url) from any TikTok link."""
     session = session or requests.Session()
     session.headers.update(HEADERS)
 
@@ -40,78 +62,106 @@ def resolve_video_id(url: str, session: requests.Session | None = None) -> tuple
 
     host = parsed.netloc.lower().removeprefix("www.")
     if not any(host == h.removeprefix("www.") for h in TIKTOK_HOSTS):
-        raise TikTokParseError("Это не ссылка на TikTok")
+        raise ParseError("Это не ссылка на TikTok")
 
     match = VIDEO_ID_RE.search(parsed.path)
     if match:
-        video_id = match.group(1)
-        return video_id, url.split("?")[0]
+        return match.group(1), url.split("?")[0]
 
     try:
         resp = session.get(url, allow_redirects=True, timeout=20)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        raise TikTokParseError(f"Не удалось открыть ссылку: {exc}") from exc
+        raise ParseError(f"Не удалось открыть ссылку: {exc}") from exc
 
     final_url = resp.url.split("?")[0]
     match = VIDEO_ID_RE.search(final_url)
     if not match:
-        raise TikTokParseError("Не удалось определить ID видео из ссылки")
+        raise ParseError("Не удалось определить ID видео из ссылки")
 
     return match.group(1), final_url
 
 
-def _parse_comment(comment: dict[str, Any], *, parent_cid: str | None = None, is_reply: bool = False) -> dict[str, Any]:
+def _parse_comment(comment: dict[str, Any], *, source_url: str, parent_cid: str | None = None, is_reply: bool = False) -> dict[str, Any]:
     user = comment.get("user") or {}
     ts = comment.get("create_time")
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-    return {
-        "cid": comment.get("cid"),
-        "parent_cid": parent_cid,
-        "is_reply": is_reply,
-        "text": comment.get("text", ""),
-        "username": user.get("unique_id") or user.get("nickname"),
-        "nickname": user.get("nickname"),
-        "likes": comment.get("digg_count", 0),
-        "reply_count": comment.get("reply_comment_total", 0),
-        "create_time": ts,
-        "create_time_iso": dt,
-        "language": comment.get("comment_language"),
-        "author_liked": comment.get("is_author_digged", False),
-        "pinned": comment.get("author_pin", False),
-    }
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else ""
+    username = user.get("unique_id") or user.get("nickname") or "unknown"
+    cid = str(comment.get("cid"))
+    urls = tiktok_urls(video_url=source_url, username=username, comment_id=cid)
+    return make_comment(
+        platform="tiktok",
+        comment_id=cid,
+        username=username,
+        text=comment.get("text", ""),
+        likes=comment.get("digg_count", 0),
+        date=dt,
+        is_reply=is_reply,
+        source_url=source_url,
+        **urls,
+    )
 
 
-def fetch_all_comments(video_id: str, video_url: str, *, progress_cb=None) -> dict[str, Any]:
-    session = requests.Session()
-    session.headers.update({**HEADERS, "Referer": video_url})
+def fetch_tiktok_comments(url: str, *, progress_cb=None) -> dict[str, Any]:
+    video_id, video_url = resolve_video_id(url)
+    session = _build_session(video_url)
 
     def fetch_page(cursor: int = 0, count: int = 50) -> dict[str, Any]:
-        params = {
-            "aid": "1988",
-            "aweme_id": video_id,
-            "count": count,
-            "cursor": cursor,
-            "device_platform": "webapp",
-            "webcast_language": "ru-RU",
-        }
-        resp = session.get("https://www.tiktok.com/api/comment/list/", params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        return _request_json(
+            session,
+            "https://www.tiktok.com/api/comment/list/",
+            {
+                "aid": "1988",
+                "aweme_id": video_id,
+                "count": count,
+                "cursor": cursor,
+                "device_platform": "webapp",
+                "webcast_language": "ru-RU",
+            },
+        )
 
     def fetch_replies(comment_id: str, cursor: int = 0, count: int = 50) -> dict[str, Any]:
-        params = {
-            "aid": "1988",
-            "aweme_id": video_id,
-            "comment_id": comment_id,
-            "count": count,
-            "cursor": cursor,
-            "device_platform": "webapp",
-            "item_type": "0",
-        }
-        resp = session.get("https://www.tiktok.com/api/comment/list/reply/", params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        return _request_json(
+            session,
+            "https://www.tiktok.com/api/comment/list/reply/",
+            {
+                "aid": "1988",
+                "aweme_id": video_id,
+                "comment_id": comment_id,
+                "count": count,
+                "cursor": cursor,
+                "device_platform": "webapp",
+                "item_type": "0",
+            },
+        )
+
+    def load_extra_replies(cid: str, inline_count: int, reply_total: int) -> None:
+        reply_cursor = inline_count
+        failures = 0
+        while reply_cursor < reply_total:
+            time.sleep(0.35)
+            try:
+                reply_data = fetch_replies(str(cid), cursor=reply_cursor)
+            except (ParseError, requests.RequestException) as exc:
+                failures += 1
+                logger.warning("TikTok replies skipped for %s: %s", cid, exc)
+                if failures >= 2:
+                    return
+                continue
+            replies = reply_data.get("comments") or []
+            if not replies:
+                return
+            for reply in replies:
+                rcid = reply.get("cid")
+                if rcid and str(rcid) not in seen_cids:
+                    seen_cids.add(str(rcid))
+                    all_comments.append(
+                        _parse_comment(reply, source_url=video_url, parent_cid=str(cid), is_reply=True)
+                    )
+            if not reply_data.get("has_more"):
+                return
+            reply_cursor = reply_data.get("cursor", reply_cursor + len(replies))
+            failures = 0
 
     all_comments: list[dict[str, Any]] = []
     seen_cids: set[str] = set()
@@ -134,75 +184,31 @@ def fetch_all_comments(video_id: str, video_url: str, *, progress_cb=None) -> di
             cid = comment.get("cid")
             if not cid or cid in seen_cids:
                 continue
-            seen_cids.add(cid)
-            all_comments.append(_parse_comment(comment))
+            seen_cids.add(str(cid))
+            all_comments.append(_parse_comment(comment, source_url=video_url))
 
             for reply in comment.get("reply_comment") or []:
                 rcid = reply.get("cid")
-                if rcid and rcid not in seen_cids:
-                    seen_cids.add(rcid)
-                    all_comments.append(_parse_comment(reply, parent_cid=cid, is_reply=True))
+                if rcid and str(rcid) not in seen_cids:
+                    seen_cids.add(str(rcid))
+                    all_comments.append(_parse_comment(reply, source_url=video_url, parent_cid=str(cid), is_reply=True))
 
             reply_total = comment.get("reply_comment_total", 0)
             inline_count = len(comment.get("reply_comment") or [])
             if reply_total > inline_count:
-                reply_cursor = inline_count
-                while True:
-                    time.sleep(0.25)
-                    reply_data = fetch_replies(cid, cursor=reply_cursor)
-                    replies = reply_data.get("comments") or []
-                    if not replies:
-                        break
-                    for reply in replies:
-                        rcid = reply.get("cid")
-                        if rcid and rcid not in seen_cids:
-                            seen_cids.add(rcid)
-                            all_comments.append(_parse_comment(reply, parent_cid=cid, is_reply=True))
-                    if not reply_data.get("has_more"):
-                        break
-                    reply_cursor = reply_data.get("cursor", reply_cursor + len(replies))
+                load_extra_replies(str(cid), inline_count, reply_total)
 
         if not has_more or not comments:
             break
         time.sleep(0.4)
 
-    top_level = sum(1 for c in all_comments if not c["is_reply"])
-    replies = len(all_comments) - top_level
+    if not all_comments:
+        raise ParseError("TikTok: комментарии не найдены")
 
-    return {
-        "video_id": video_id,
-        "video_url": video_url,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-        "reported_total": reported_total,
-        "total_comments": len(all_comments),
-        "top_level_comments": top_level,
-        "replies": replies,
-        "comments": all_comments,
-    }
-
-
-def to_json_bytes(data: dict[str, Any]) -> bytes:
-    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-
-
-def to_csv_bytes(comments: list[dict[str, Any]]) -> bytes:
-    fields = [
-        "cid",
-        "parent_cid",
-        "is_reply",
-        "username",
-        "nickname",
-        "text",
-        "likes",
-        "reply_count",
-        "create_time_iso",
-        "language",
-        "author_liked",
-        "pinned",
-    ]
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=fields)
-    writer.writeheader()
-    for comment in comments:
-        writer.writerow({key: comment.get(key) for key in fields})
-    return buf.getvalue().encode("utf-8")
+    return build_result(
+        platform="tiktok",
+        source_id=video_id,
+        source_url=video_url,
+        comments=all_comments,
+        reported_total=reported_total,
+    )
