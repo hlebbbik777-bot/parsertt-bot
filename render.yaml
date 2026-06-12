@@ -14,4 +14,4 @@ services:
       - key: VK_ACCESS_TOKEN
         sync: false
       - key: BOT_MODE
-        value: auto
+        value: proxy

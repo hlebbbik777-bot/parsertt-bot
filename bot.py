@@ -11,7 +11,8 @@ import re
 import sys
 import threading
 
-from flask import Flask
+import requests as http_requests
+from flask import Flask, Response, request
 from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -168,19 +169,25 @@ def build_application() -> Application:
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
 
-    request = HTTPXRequest(
-        connect_timeout=60.0,
-        read_timeout=180.0,
-        write_timeout=180.0,
-        pool_timeout=60.0,
-    )
-    app = (
-        Application.builder()
-        .token(token)
-        .request(request)
-        .get_updates_request(request)
-        .build()
-    )
+    proxy = os.environ.get("TELEGRAM_PROXY") or os.environ.get("HTTPS_PROXY")
+    base_url = os.environ.get("TELEGRAM_API_BASE")
+    request_kwargs = {
+        "connect_timeout": 60.0,
+        "read_timeout": 180.0,
+        "write_timeout": 180.0,
+        "pool_timeout": 60.0,
+    }
+    if proxy:
+        request_kwargs["proxy"] = proxy
+        logger.info("Using Telegram proxy: %s", proxy.split("@")[-1])
+
+    request = HTTPXRequest(**request_kwargs)
+    builder = Application.builder().token(token).request(request).get_updates_request(request)
+    if base_url:
+        builder = builder.base_url(base_url.rstrip("/") + "/bot")
+        builder = builder.base_file_url(base_url.rstrip("/") + "/file/bot")
+        logger.info("Using local Telegram API: %s", base_url)
+    app = builder.build()
     app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
     app.add_handler(CommandHandler("start", start))
@@ -201,14 +208,59 @@ def run_polling(app: Application) -> None:
     )
 
 
-def run_with_health_server(app: Application) -> None:
-    port = int(os.environ.get("PORT", "10000"))
+def create_flask_app(*, enable_proxy: bool = False) -> Flask:
     flask_app = Flask(__name__)
 
     @flask_app.get("/")
     @flask_app.get("/health")
     def health():
         return "ok", 200
+
+    if enable_proxy:
+        @flask_app.route("/telegram-api/<path:subpath>", methods=["GET", "POST"])
+        def telegram_api_proxy(subpath: str):
+            upstream = f"https://api.telegram.org/{subpath}"
+            headers = {}
+            if request.content_type:
+                headers["Content-Type"] = request.content_type
+            try:
+                proxied = http_requests.request(
+                    request.method,
+                    upstream,
+                    params=request.args,
+                    data=request.get_data(),
+                    headers=headers,
+                    timeout=120,
+                )
+            except http_requests.RequestException as exc:
+                logger.warning("Telegram proxy error: %s", exc)
+                return Response(f"proxy error: {exc}", status=502)
+
+            excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+            response_headers = {
+                key: value
+                for key, value in proxied.headers.items()
+                if key.lower() not in excluded
+            }
+            return Response(proxied.content, status=proxied.status_code, headers=response_headers)
+
+    return flask_app
+
+
+def run_flask_server(flask_app: Flask) -> None:
+    port = int(os.environ.get("PORT", "10000"))
+    logger.info("HTTP server on port %s", port)
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+def run_proxy_server() -> None:
+    logger.info("Telegram API proxy mode")
+    run_flask_server(create_flask_app(enable_proxy=True))
+
+
+def run_with_health_server(app: Application) -> None:
+    flask_app = create_flask_app(enable_proxy=True)
+    port = int(os.environ.get("PORT", "10000"))
 
     thread = threading.Thread(
         target=lambda: flask_app.run(
@@ -226,8 +278,13 @@ def run_with_health_server(app: Application) -> None:
 
 def main() -> None:
     acquire_single_instance_lock()
-    app = build_application()
     mode = os.environ.get("BOT_MODE", "auto").lower()
+
+    if mode == "proxy":
+        run_proxy_server()
+        return
+
+    app = build_application()
 
     if mode == "polling" or not os.environ.get("PORT"):
         run_polling(app)
